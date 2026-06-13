@@ -80,6 +80,8 @@ The live `pywwise` connection is exposed as `w.ak` for anything the helpers don'
 
 ## Credits
 
+Created by [Ziggy641](https://github.com/Ziggy641).
+
 Built on [pywwise](https://pypi.org/project/pywwise/). Wwise is a trademark of Audiokinetic Inc. This project is not affiliated with or endorsed by Audiokinetic.
 
 ## License
