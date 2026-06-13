@@ -1,5 +1,7 @@
 # wwise-control
 
+基于python脚本实现使用自然语言指令让agent控制wwise工程内部建构
+
 A [Claude Code](https://claude.com/claude-code) **skill** + Python module for controlling an [Audiokinetic Wwise](https://www.audiokinetic.com/) project through natural-language instructions.
 
 Tell your AI coding agent what you want — *"create a Random Container under the Actor-Mixer hierarchy and route it to the SFX bus with a +3 dB aux send"* — and it drives Wwise for you over the Wwise Authoring API (WAAPI), no manual scripting and no opening the terminal yourself.
