@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Temp execution scripts (created at runtime by the agent)
+_exec.py
+_probe.py
+_cleanup.py
+
+# OS
+.DS_Store
+Thumbs.db
