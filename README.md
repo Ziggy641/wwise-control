@@ -1,6 +1,8 @@
 # wwise-control
 
-基于python脚本实现使用自然语言指令让agent控制wwise工程内部建构
+基于python脚本实现使用自然语言指令让agent控制wwise工程内部建构。需在wwise的user preferences里开启 enable wwise authoring api
+
+打开wwise工程，测试连接。连接成功后直接与agent对话，告诉它你想要进行的操作。比如：在actor mixer层级下新建5个random容器，前缀命名为abc，后缀为从1开始的顺序数字。
 
 A [Claude Code](https://claude.com/claude-code) **skill** + Python module for controlling an [Audiokinetic Wwise](https://www.audiokinetic.com/) project through natural-language instructions.
 
