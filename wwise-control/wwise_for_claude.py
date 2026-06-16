@@ -25,6 +25,8 @@ Interactive REPL (run directly):
 """
 
 import sys
+import json
+import contextlib
 import pywwise
 from collections import Counter, defaultdict
 
@@ -218,6 +220,224 @@ def set_property(obj, prop_name, value):
         print(f"[设置成功] {obj.name}.{prop_name} = {value}")
     except Exception as e:
         print(f"[设置属性失败] {prop_name}: {e}")
+
+
+# ── 插件 / RTPC / 调制 / 路由（底层 object.set 封装）──────────
+#
+# 这些操作 pywwise 的高层接口做不了（建插件要 classId、建 RTPC/调制/曲线
+# 要设引用和列表），必须走底层 ak._client.call("ak.wwise.core.object.set", …)。
+# 经实测总结的 object.set 规则（全部用 @ 前缀）：
+#   @<属性>      -> 属性值，如 "@Volume": -6.0、"@PropertyName": "Volume"
+#   @<引用>      -> 引用：guid 字符串 或 内联待建对象，如 "@ControlInput"、"@Curve"、"@Effect"
+#   @<列表名>    -> 在列表里建对象（数组），如 "@RTPC": [...]、"@Effects": [...]
+#   children:[…] -> 仅子对象层级（Sound→SourcePlugin）；RTPC/Effect 是“列表”不是 children
+#   曲线对象 curveObjectDefinition 只能含 type+points，多一个字段(含 name)都会被拒
+#   读取(get)时引用/属性不带 @；写入(set)时一律带 @
+#   失败会静默返回 None（不报错）；下面的 raw_set 会在 None 时主动抛出明确异常
+
+# 常用插件 classId（完整列表用 list_plugins()）
+PLUGIN_CLASS_IDS = {
+    # 声源（Source）
+    "Wwise Synth One": 9699330,
+    "Wwise Tone Generator": 6684674,
+    "Wwise Sine": 6553602,
+    "Wwise Silence": 6619138,
+    "Wwise Audio Input": 13107202,
+    "SoundSeed Air Wind": 7798786,
+    "SoundSeed Air Woosh": 7864322,
+    "SoundSeed Grain": 11993090,
+    # 效果器（Effect）
+    "Wwise Peak Limiter": 7208963,
+    "Wwise Parametric EQ": 6881283,
+    "Wwise Compressor": 7077891,
+    "Wwise Expander": 7143427,
+    "Wwise Gain": 9109507,
+    "Wwise Delay": 6946819,
+    "Wwise RoomVerb": 7733251,
+    "Wwise Matrix Reverb": 7536643,
+    "Wwise Meter": 8454147,
+    "Wwise Flanger": 8192003,
+    "Wwise Tremolo": 8585219,
+    "Wwise Pitch Shifter": 8912899,
+    "Wwise Stereo Delay": 8847363,
+    "Wwise Guitar Distortion": 8257539,
+}
+
+# LFO 波形枚举（@LfoWaveform 的取值）
+LFO_WAVEFORMS = {"sine": 0, "square": 1, "triangle": 2, "saw_up": 3, "saw_down": 4}
+
+
+def _guid(obj):
+    """把 对象 / guid字符串 统一转成 guid 字符串。"""
+    if obj is None:
+        raise ValueError("[错误] 对象为 None")
+    if isinstance(obj, str):
+        return obj
+    if hasattr(obj, "guid"):
+        return obj.guid
+    raise TypeError(f"[错误] 无法从 {type(obj)} 取得 guid")
+
+
+def _class_id(plugin):
+    """把 插件名 / classId整数 统一转成 classId 整数。"""
+    if isinstance(plugin, int):
+        return plugin
+    if plugin in PLUGIN_CLASS_IDS:
+        return PLUGIN_CLASS_IDS[plugin]
+    raise ValueError(f"[错误] 未知插件 '{plugin}'，请用 list_plugins() 查 classId，或直接传整数 classId")
+
+
+def raw_set(*object_ops, on_name_conflict="rename", list_mode="append"):
+    """底层 ak.wwise.core.object.set 封装。每个 object_op 是一个 dict（含 'object' + @键/children）。
+    失败时（Wwise 返回 None）主动抛出明确异常，而不是静默失败。返回 WAAPI 结果 dict。"""
+    _ensure_connected()
+    args = {"objects": list(object_ops),
+            "onNameConflict": on_name_conflict,
+            "listMode": list_mode}
+    res = ak._client.call("ak.wwise.core.object.set", args)
+    if res is None:
+        raise RuntimeError(
+            "[object.set 失败] payload 被 Wwise 拒绝并静默返回 None。常见原因：\n"
+            "  · 引用键缺少 @ 前缀（应为 @ControlInput / @OutputBus …）\n"
+            "  · 把 RTPC/Effect 放进了 children，而它们应在 @RTPC / @Effects 列表里\n"
+            "  · 曲线对象除 type/points 外多了字段\n"
+            "想看 Wwise 的真实报错：用独立进程开 "
+            "waapi.WaapiClient(url, allow_exception=True) 重放该 payload（运行期改 "
+            "_allow_exception 无效，且同进程不能开两个 client）。\n"
+            f"payload = {json.dumps(args, ensure_ascii=False)[:600]}")
+    return res
+
+
+def raw_get(waql, returns=("id", "name", "type")):
+    """底层 ak.wwise.core.object.get 封装，返回对象列表（dict）。"""
+    _ensure_connected()
+    res = ak._client.call("ak.wwise.core.object.get",
+                          {"waql": waql, "options": {"return": list(returns)}})
+    return (res or {}).get("return", [])
+
+
+def set_reference(obj, reference_name, target):
+    """设置对象的引用（如 OutputBus、Attenuation）。模块原先只有 set_property，这里补上 set_reference。"""
+    _ensure_connected()
+    try:
+        ak.wwise.core.object.set_reference(_guid(obj), reference_name, _guid(target))
+        print(f"[引用设置] {reference_name} -> {_guid(target)}")
+        return True
+    except Exception as e:
+        print(f"[引用设置失败] {reference_name}: {e}")
+        return False
+
+
+@contextlib.contextmanager
+def undo_group(name="Claude 批量操作"):
+    """把一批写操作合并成一次 Ctrl+Z。用法：with undo_group('描述'): ...。"""
+    _ensure_connected()
+    ak._client.call("ak.wwise.core.undo.beginGroup", {})
+    try:
+        yield
+    finally:
+        ak._client.call("ak.wwise.core.undo.endGroup", {"displayName": name})
+
+
+def create_source(parent_sound, plugin, name=None, **props):
+    """在 Sound 下创建合成器/声源插件并返回其 guid。
+        plugin : 插件名(见 PLUGIN_CLASS_IDS) 或 classId 整数
+        props  : 以属性名传插件参数，如 NoiseLevel=0.0, BaseFrequency=60, Osc1Level=-6
+    示例： create_source(snd, 'Wwise Synth One', NoiseLevel=0.0, BaseFrequency=60)
+    """
+    pid = _class_id(plugin)
+    name = name or (plugin if isinstance(plugin, str) else "Source")
+    node = {"type": "SourcePlugin", "name": name, "classId": pid}
+    for k, v in props.items():
+        node[f"@{k}"] = v
+    res = raw_set({"object": _guid(parent_sound), "children": [node]})
+    guid = res["objects"][0]["children"][0]["id"]
+    print(f"[声源创建] {name} (classId {pid}) -> {guid}")
+    return guid
+
+
+def add_effect(target, plugin, name=None):
+    """给 Bus / Actor-Mixer / Sound 挂效果器（默认设置）。返回 (slot_guid, effect_guid)。
+    示例： add_effect(bus, 'Wwise Peak Limiter')
+    """
+    pid = _class_id(plugin)
+    name = name or (plugin if isinstance(plugin, str) else "Effect")
+    res = raw_set({"object": _guid(target),
+                   "@Effects": [{"type": "EffectSlot", "name": "",
+                                 "@Effect": {"type": "Effect", "name": name, "classId": pid}}]})
+    slot = res["objects"][0]["@Effects"][0]
+    eff = slot["@Effect"]["id"]
+    print(f"[效果器挂载] {name} (classId {pid}) -> {eff}")
+    return slot["id"], eff
+
+
+def add_rtpc(owner, property_name, control_input, points=None):
+    """为对象属性建立 RTPC（绑定到 Game Parameter 或 Modulator），返回 RTPC 对象 guid。
+        owner          : 受控对象（Sound / 声源 / 调制器…）
+        property_name  : 'Volume' / 'Pitch' / 'OutputLevel' / 'LfoFrequency' …
+        control_input  : Game Parameter 或 Modulator 的对象/guid
+        points         : [(x, y)] 或 [(x, y, shape)] 曲线点；None 则用 Wwise 默认曲线
+    注意：调制器作为控制源时，其输出（曲线 X 轴）范围是 0..1。
+    示例： add_rtpc(snd, 'Volume', rpm, [(0, -96), (100, 0)])
+    """
+    res = raw_set({"object": _guid(owner),
+                   "@RTPC": [{"type": "RTPC", "name": "",
+                              "@PropertyName": property_name,
+                              "@ControlInput": _guid(control_input)}]})
+    rid = res["objects"][0]["@RTPC"][0]["id"]
+    if points:
+        pts = [{"x": p[0], "y": p[1], "shape": (p[2] if len(p) > 2 else "Linear")} for p in points]
+        raw_set({"object": rid, "@Curve": {"type": "Curve", "points": pts}})
+    print(f"[RTPC] {property_name} <- {_guid(control_input)} -> {rid}")
+    return rid
+
+
+def set_routing(obj, bus):
+    """把对象输出路由到指定 Bus（自动开启 OverrideOutput）。"""
+    _ensure_connected()
+    g = _guid(obj)
+    ak.wwise.core.object.set_property(g, "OverrideOutput", True)
+    ak.wwise.core.object.set_reference(g, "OutputBus", _guid(bus))
+    print(f"[路由] {g} -> bus {_guid(bus)}")
+
+
+def create_modulator(name, kind="lfo", parent=None, **props):
+    """创建调制器 ShareSet（默认 LFO），返回 guid。parent 默认 \\Modulators\\Default Work Unit。
+        kind  : 'lfo' / 'envelope' / 'time'
+        props : 如 LfoWaveform=LFO_WAVEFORMS['saw_down'], LfoFrequency=12, LfoDepth=100
+    """
+    _ensure_connected()
+    etype = {"lfo": pywwise.EObjectType.MODULATOR_LFO,
+             "envelope": pywwise.EObjectType.MODULATOR_ENVELOPE,
+             "time": pywwise.EObjectType.MODULATOR_TIME}[kind]
+    if parent is None:
+        parent = find_path(r"\Modulators\Default Work Unit")
+    obj = ak.wwise.core.object.create(name=name, etype=etype, parent=_guid(parent),
+                                      name_conflict_strategy=pywwise.ENameConflictStrategy.RENAME)
+    g = obj.guid
+    for k, v in props.items():
+        ak.wwise.core.object.set_property(g, k, v)
+    print(f"[调制器] {name} ({kind}) -> {g}")
+    return g
+
+
+def list_plugins(keyword=""):
+    """列出工程可用的声源/效果器插件及其 classId（建插件时用）。可传关键字过滤。"""
+    _ensure_connected()
+    try:
+        ts = ak.wwise.core.object.get_types()
+    except Exception as e:
+        print(f"[获取类型失败] {e}")
+        return []
+    rows = []
+    for t in ts:
+        d = t if isinstance(t, dict) else getattr(t, "__dict__", {})
+        nm, cid, ty = d.get("name"), d.get("classId"), d.get("type")
+        if ty in ("Source", "Effect") and (not keyword or keyword.lower() in str(nm).lower()):
+            rows.append((ty, nm, cid))
+    for ty, nm, cid in sorted(rows):
+        print(f"  [{ty:<6}] {nm:<28} classId={cid}")
+    return rows
 
 
 # ── 子对象 / 列表展示 ──────────────────────────────────────
@@ -416,8 +636,12 @@ if __name__ == "__main__":
     print()
     print("查找：  find(name)  |  find_path(path)  |  find_contains(keyword)")
     print("操作：  create / rename / move / delete")
-    print("属性：  get_property(obj, prop)  |  set_property(obj, prop, value)")
+    print("属性：  get_property(obj, prop)  |  set_property(obj, prop, value)  |  set_reference(obj, ref, target)")
     print("浏览：  ls(obj)  |  children(obj)  |  count(type)  |  types(obj)")
+    print("合成：  create_source(snd, 'Wwise Synth One', ...)  |  add_effect(bus, 'Wwise Peak Limiter')")
+    print("调制：  create_modulator(name, 'lfo', LfoFrequency=12)  |  list_plugins(keyword)")
+    print("RTPC：  add_rtpc(owner, 'Volume', ctrl, [(0,-96),(100,0)])  |  set_routing(obj, bus)")
+    print("底层：  raw_set(*ops)  |  raw_get(waql, returns)  |  with undo_group('描述'): ...")
     print("试听：  play(obj)  |  stop_all()")
     print("导出：  generate_soundbank(name)")
     print()
@@ -434,8 +658,14 @@ if __name__ == "__main__":
             'find': find, 'find_path': find_path, 'find_contains': find_contains,
             'create': create, 'rename': rename, 'move': move, 'delete': delete,
             'get_property': get_property, 'set_property': set_property,
+            'set_reference': set_reference,
             'children': children, 'ls': ls,
             'count': count, 'types': types,
+            'raw_set': raw_set, 'raw_get': raw_get, 'undo_group': undo_group,
+            'create_source': create_source, 'add_effect': add_effect,
+            'add_rtpc': add_rtpc, 'set_routing': set_routing,
+            'create_modulator': create_modulator, 'list_plugins': list_plugins,
+            'PLUGIN_CLASS_IDS': PLUGIN_CLASS_IDS, 'LFO_WAVEFORMS': LFO_WAVEFORMS,
             'play': play, 'stop_all': stop_all,
             'generate_soundbank': generate_soundbank,
         },
