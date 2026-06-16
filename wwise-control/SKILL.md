@@ -19,7 +19,16 @@ Higher-level builders for things pywwise can't do directly — `create_source`, 
 
 The live `pywwise` connection is `w.ak` — use it directly for anything the helpers don't cover.
 
+## Session start: connect & report
+
+When the user invokes this skill (or says to connect), **run `connect_info.py`** (in this skill's directory) first. It connects, prints the running project's basic info (name, Wwise version, path, platform, language, is_dirty, license, SoundBank path) plus a top-level hierarchy overview, then disconnects. Show that to the user and wait for instructions.
+
+There is **no persistent session**: each operation is a fresh Python process that connects, acts, and disconnects. "Waiting for instructions" means you (the agent) stay ready — each natural-language instruction becomes a short per-task script run via the module. Re-connecting per operation is fast enough.
+
 ## How to run
+
+> **Windows note:** invoke scripts with the `py` launcher, **not** `python`. On many machines `python`/`python3` on PATH is the Microsoft Store App Execution Alias stub, which exits with code 9009 instead of running. `py` resolves the real interpreter.
+
 
 Write a short temp script (e.g. `_exec.py`) next to the module, run it with the system Python, then delete it. Prefer a temp file over `-c`/stdin (multi-line code and non-ASCII paths survive intact in a file).
 
